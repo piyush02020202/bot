@@ -2,10 +2,155 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits: P, EmbedBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
 const mongoose = require('mongoose');
-// Works whether files are in ./src or all in the repo root
-const load = (n) => { try { return require('./src/' + n); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; return require('./' + n); } };
-const { Queue, queues, resolve, fmt } = load('music');
-const { startWeb, token } = load('web');
+const PLAYER_HTML = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Music Player</title>\n<style>\nbody{margin:0;font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;display:flex;justify-content:center}\n.c{width:100%;max-width:560px;padding:20px}\n.card{background:#1f2937;border-radius:14px;padding:18px;margin-bottom:14px}\nimg{width:100%;border-radius:10px;margin-bottom:10px}\nbutton,input{font:inherit;border-radius:8px;border:0;padding:10px 14px}\nbutton{background:#5865f2;color:#fff;cursor:pointer;margin:4px 4px 0 0}button.d{background:#dc2626}\ninput{width:calc(100% - 100px);background:#374151;color:#fff}\nli{padding:6px 0;border-bottom:1px solid #374151;list-style:none}ul{padding:0;margin:0}\n#msg{color:#fca5a5;min-height:20px}\n</style></head><body><div class=\"c\">\n<h2>\ud83c\udfb5 Music Web Player</h2>\n<div class=\"card\" id=\"now\">Loading\u2026</div>\n<div class=\"card\">\n <button onclick=\"act('toggle')\">\u23ef Pause/Resume</button><button onclick=\"act('skip')\">\u23ed Skip</button>\n <button onclick=\"act('loop')\">\ud83d\udd01 Loop</button><button class=\"d\" onclick=\"act('stop')\">\u23f9 Stop</button>\n</div>\n<div class=\"card\"><input id=\"q\" placeholder=\"Song name or YouTube URL\"><button onclick=\"add()\">Add</button><div id=\"msg\"></div></div>\n<div class=\"card\"><b>Up next</b><ul id=\"list\"></ul></div>\n</div>\n<script>\nconst gid=location.pathname.split('/').pop(),t=new URLSearchParams(location.search).get('t');\nconst api=(p,o)=>fetch(`/api/${gid}/${p}?t=${t}`,o).then(r=>r.json());\nconst msg=m=>document.getElementById('msg').textContent=m||'';\nasync function act(a){const r=await api(a,{method:'POST'});msg(r.error);refresh()}\nasync function add(){const q=document.getElementById('q');const r=await api('play',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q.value})});msg(r.error);q.value='';setTimeout(refresh,1500)}\nconst esc=s=>String(s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));\nasync function refresh(){\n const s=await api('state');const n=document.getElementById('now');\n if(s.error){n.textContent=s.error;return}\n if(!s.active||!s.current){n.innerHTML='Nothing playing. Use <b>/play</b> in Discord to start.'}\n else{n.innerHTML=(s.current.thumb?`<img src=\"${esc(s.current.thumb)}\">`:'')+`<b>${esc(s.current.title)}</b><br>${s.paused?'\u23f8 Paused':'\u25b6 Playing'} \u2022 Loop: ${s.loop}`}\n document.getElementById('list').innerHTML=(s.queue||[]).map(x=>`<li>${esc(x.title)}</li>`).join('')||'<li>Empty</li>';\n}\nrefresh();setInterval(refresh,2500);\n</script></body></html>\n";
+const MUSIC = (() => { const module = { exports: {} };
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus,
+  VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const play = require('play-dl');
+
+if (process.env.YT_COOKIE) play.setToken({ youtube: { cookie: process.env.YT_COOKIE } });
+
+const queues = new Map();
+const fmt = (s) => { s = Number(s) || 0; return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+async function resolve(query, by) {
+  const mk = (v) => ({ title: v.title || 'Unknown', url: v.url, duration: v.durationInSec || 0, thumb: v.thumbnails?.[0]?.url, by });
+  const type = play.yt_validate(query);
+  if (type === 'playlist') {
+    const pl = await play.playlist_info(query, { incomplete: true });
+    return (await pl.all_videos()).slice(0, 50).map(mk);
+  }
+  if (type === 'video') return [mk((await play.video_info(query)).video_details)];
+  const r = await play.search(query, { limit: 1, source: { youtube: 'video' } });
+  return r.map(mk);
+}
+
+class Queue {
+  constructor(guild, voiceChannel, textChannel) {
+    this.guild = guild; this.textChannel = textChannel;
+    this.songs = []; this.current = null; this.loop = 'off'; this.dead = false; this.skipFlag = false;
+    this.player = createAudioPlayer();
+    this.connection = joinVoiceChannel({ channelId: voiceChannel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator });
+    this.connection.subscribe(this.player);
+    this.player.on(AudioPlayerStatus.Idle, () => !this.dead && this.next());
+    this.player.on('error', (e) => { console.error('player:', e.message); });
+    this.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      try {
+        await Promise.race([entersState(this.connection, VoiceConnectionStatus.Signalling, 5000),
+          entersState(this.connection, VoiceConnectionStatus.Connecting, 5000)]);
+      } catch { this.destroy(); }
+    });
+    queues.set(guild.id, this);
+  }
+  enqueue(songs) {
+    clearTimeout(this.idleTimer);
+    this.songs.push(...songs);
+    if (!this.current) this.next();
+  }
+  next() {
+    if (this.loop === 'track' && this.current && !this.skipFlag) { /* replay same */ }
+    else {
+      if (this.loop === 'queue' && this.current) this.songs.push(this.current);
+      this.current = this.songs.shift() || null;
+    }
+    this.skipFlag = false;
+    if (!this.current) { this.idleTimer = setTimeout(() => this.destroy(), 120000); return; }
+    this.playCurrent();
+  }
+  async playCurrent() {
+    const song = this.current;
+    try {
+      const s = await play.stream(song.url, { quality: 2 });
+      this.player.play(createAudioResource(s.stream, { inputType: s.type }));
+      this.textChannel?.send(this.panel()).catch(() => {});
+    } catch (e) {
+      this.textChannel?.send(`❌ Couldn't play **${song.title}**: ${e.message}`).catch(() => {});
+      this.skipFlag = true; this.next();
+    }
+  }
+  toggle() { this.player.state.status === AudioPlayerStatus.Paused ? this.player.unpause() : this.player.pause(); }
+  skip() { this.skipFlag = true; this.player.stop(); if (!this.current) this.next(); }
+  cycleLoop() { this.loop = { off: 'track', track: 'queue', queue: 'off' }[this.loop]; return this.loop; }
+  destroy() {
+    if (this.dead) return; this.dead = true; clearTimeout(this.idleTimer);
+    this.songs = []; this.current = null;
+    try { this.player.stop(true); this.connection.destroy(); } catch {}
+    queues.delete(this.guild.id);
+  }
+  state() {
+    return {
+      paused: this.player.state.status === AudioPlayerStatus.Paused, loop: this.loop,
+      current: this.current, queue: this.songs.slice(0, 25),
+    };
+  }
+  panel() {
+    const s = this.current;
+    const embed = new EmbedBuilder().setColor(0x5865f2)
+      .setTitle(s ? '🎶 Now playing' : '💤 Nothing playing')
+      .setDescription(s ? `**[${s.title}](${s.url})**\nDuration: ${fmt(s.duration)} • Requested by ${s.by}` : 'Use `/play` to add a song.')
+      .setFooter({ text: `Loop: ${this.loop} • Up next: ${this.songs.length}` });
+    if (s?.thumb) embed.setThumbnail(s.thumb);
+    const b = (id, label, style = ButtonStyle.Secondary) => new ButtonBuilder().setCustomId(`music:${id}`).setLabel(label).setStyle(style);
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(
+      b('toggle', '⏯ Pause/Resume'), b('skip', '⏭ Skip'), b('loop', '🔁 Loop'), b('stop', '⏹ Stop', ButtonStyle.Danger)
+    )] };
+  }
+}
+
+module.exports = { Queue, queues, resolve, fmt };
+
+return module.exports; })();
+const WEB = (() => { const module = { exports: {} };
+const express = require('express');
+const crypto = require('crypto');
+const { queues, resolve } = MUSIC;
+
+const SECRET = process.env.SESSION_SECRET || 'change-me';
+const token = (gid) => crypto.createHmac('sha256', SECRET).update(gid).digest('hex').slice(0, 24);
+
+function startWeb() {
+  const app = express();
+  app.use(express.json());
+  app.get('/', (_, r) => r.send('Bot is running ✅'));
+  app.get('/health', (_, r) => r.send('ok'));
+    app.get('/player/:gid', (_, r) => r.type('html').send(PLAYER_HTML));
+
+  app.use('/api/:gid', (req, res, next) => {
+    if (req.query.t !== token(req.params.gid)) return res.status(403).json({ error: 'Invalid link' });
+    next();
+  });
+  app.get('/api/:gid/state', (req, res) => {
+    const q = queues.get(req.params.gid);
+    res.json(q ? { active: true, ...q.state() } : { active: false });
+  });
+  app.post('/api/:gid/:action', async (req, res) => {
+    const q = queues.get(req.params.gid);
+    if (!q) return res.status(404).json({ error: 'Bot is not in a voice channel. Use /play in Discord first.' });
+    try {
+      const a = req.params.action;
+      if (a === 'toggle') q.toggle();
+      else if (a === 'skip') q.skip();
+      else if (a === 'loop') q.cycleLoop();
+      else if (a === 'stop') q.destroy();
+      else if (a === 'play') q.enqueue(await resolve(String(req.body.query || ''), 'Web player'));
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => console.log('Web listening on', port));
+
+  // keep free hosts (e.g. Render) awake
+  const self = process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL;
+  if (self) setInterval(() => fetch(self + '/health').catch(() => {}), 10 * 60 * 1000);
+}
+
+module.exports = { startWeb, token };
+
+return module.exports; })();
+const { Queue, queues, resolve, fmt } = MUSIC;
+const { startWeb, token } = WEB;
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates] });
 const Guild = mongoose.model('Guild', new mongoose.Schema({ _id: String, welcomeChannel: String, welcomeMessage: String }));
