@@ -2,8 +2,10 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits: P, EmbedBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
 const mongoose = require('mongoose');
-const { Queue, queues, resolve, fmt } = require('./src/music');
-const { startWeb, token } = require('./src/web');
+// Works whether files are in ./src or all in the repo root
+const load = (n) => { try { return require('./src/' + n); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; return require('./' + n); } };
+const { Queue, queues, resolve, fmt } = load('music');
+const { startWeb, token } = load('web');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildVoiceStates] });
 const Guild = mongoose.model('Guild', new mongoose.Schema({ _id: String, welcomeChannel: String, welcomeMessage: String }));
